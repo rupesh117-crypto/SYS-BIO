@@ -26,6 +26,38 @@ st.markdown("---")
 # ==========================================
 @st.cache_resource
 def load_ml_classifier():
+    import requests
+
+@st.cache_data(ttl=3600)
+def fetch_live_uniprot_pah_variants():
+    """Fetches live curated PAH natural variants from the UniProt REST API (P00439)."""
+    url = "https://rest.uniprot.org/uniprotkb/P00439.json"
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        variants = []
+        for feature in data.get("features", []):
+            if feature.get("type") == "Natural variant":
+                pos = feature.get("location", {}).get("start", {}).get("value", "N/A")
+                alt_seq = feature.get("alternativeSequence", {})
+                wt = alt_seq.get("originalSequence", "")
+                muts = alt_seq.get("alternativeSequences", [])
+                mut = muts[0] if muts else ""
+                desc = feature.get("description", "No clinical description available")
+                
+                if wt and mut:
+                    variants.append({
+                        "Mutation": f"{wt}{pos}{mut}",
+                        "Position": pos,
+                        "Wild-Type": wt,
+                        "Mutant": mut,
+                        "Clinical Annotation (UniProt)": desc
+                    })
+        return pd.DataFrame(variants), None
+    except Exception as e:
+        return pd.DataFrame(), str(e)
     np.random.seed(42)
     n_samples = 500
     delta_g = np.random.uniform(0.5, 6.5, n_samples)
