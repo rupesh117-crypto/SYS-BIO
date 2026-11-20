@@ -134,6 +134,7 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "⚡ 2. Metabolic Flux (FBA)", 
     "🤖 3. Phenotype Prediction", 
     "📋 4. Integrative Summary"
+    "🌐 5. Live UniProt API"
 ])
 
 # --- TAB 1 ---
@@ -235,3 +236,26 @@ with tab4:
         file_name=f"pku_capstone_report_custom.csv",
         mime='text/csv'
     )
+    # --- TAB 5: LIVE UNIPROT API ---
+with tab5:
+    st.subheader("Live PAH Variant Feed (UniProt REST API: P00439)")
+    st.markdown("Real-time clinical variants fetched directly from the UniProt Knowledgebase.")
+    
+    with st.spinner("Fetching live PAH variants from UniProt..."):
+        df_live, error = fetch_live_uniprot_pah_variants()
+        
+    if error:
+        st.error(f"Could not connect to UniProt API: {error}")
+    else:
+        st.success(f"Successfully fetched **{len(df_live)} live PAH variants** from UniProt!")
+        
+        # Add a search bar so evaluators can look up any mutation (e.g., R408W)
+        search_query = st.text_input("🔍 Search for a specific mutation (e.g., R408W, R261Q, PKU):", "")
+        if search_query:
+            filtered_df = df_live[
+                df_live["Mutation"].str.contains(search_query, case=False, na=False) |
+                df_live["Clinical Annotation (UniProt)"].str.contains(search_query, case=False, na=False)
+            ]
+            st.dataframe(filtered_df, use_container_width=True)
+        else:
+            st.dataframe(df_live, use_container_width=True)
