@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import requests
 import plotly.express as px
 import plotly.graph_objects as go
 from sklearn.ensemble import RandomForestClassifier
@@ -22,11 +23,23 @@ genome-scale metabolic flux analysis (FBA), and machine learning phenotype predi
 st.markdown("---")
 
 # ==========================================
-# MODEL CACHING
+# MODEL & API CACHING
 # ==========================================
 @st.cache_resource
 def load_ml_classifier():
-    import requests
+    np.random.seed(42)
+    n_samples = 500
+    delta_g = np.random.uniform(0.5, 6.5, n_samples)
+    activity = np.maximum(0, 1.0 - (delta_g / 7.0) + np.random.normal(0, 0.08, n_samples))
+    phe_levels = (1.0 - activity) * 1250 + np.random.normal(0, 40, n_samples)
+    bh4_resp = (activity > 0.25).astype(int)
+    
+    X = np.column_stack((delta_g, activity, phe_levels, bh4_resp))
+    y = np.where(phe_levels > 900, 0, np.where(phe_levels > 360, 1, 2))
+    
+    clf = RandomForestClassifier(n_estimators=150, random_state=42)
+    clf.fit(X, y)
+    return clf
 
 @st.cache_data(ttl=3600)
 def fetch_live_uniprot_pah_variants():
@@ -58,19 +71,6 @@ def fetch_live_uniprot_pah_variants():
         return pd.DataFrame(variants), None
     except Exception as e:
         return pd.DataFrame(), str(e)
-    np.random.seed(42)
-    n_samples = 500
-    delta_g = np.random.uniform(0.5, 6.5, n_samples)
-    activity = np.maximum(0, 1.0 - (delta_g / 7.0) + np.random.normal(0, 0.08, n_samples))
-    phe_levels = (1.0 - activity) * 1250 + np.random.normal(0, 40, n_samples)
-    bh4_resp = (activity > 0.25).astype(int)
-    
-    X = np.column_stack((delta_g, activity, phe_levels, bh4_resp))
-    y = np.where(phe_levels > 900, 0, np.where(phe_levels > 360, 1, 2))
-    
-    clf = RandomForestClassifier(n_estimators=150, random_state=42)
-    clf.fit(X, y)
-    return clf
 
 rf_model = load_ml_classifier()
 
@@ -115,7 +115,6 @@ variant_choice = st.sidebar.selectbox(
 st.sidebar.markdown("---")
 st.sidebar.subheader("Fine-Tune Parameters")
 
-# Fully interactive sliders linked directly to session state
 delta_g_val = st.sidebar.slider("Structural Destabilization (ΔΔG kcal/mol)", 0.5, 7.0, key="delta_g", step=0.1)
 activity_val = st.sidebar.slider("Residual PAH Activity Fraction", 0.0, 1.0, key="activity", step=0.01)
 bh4_override = st.sidebar.checkbox("BH4 Responsive", key="bh4")
@@ -129,11 +128,11 @@ else:
 # ==========================================
 # MAIN DASHBOARD TABS
 # ==========================================
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "🔬 1. Structural Analysis", 
     "⚡ 2. Metabolic Flux (FBA)", 
     "🤖 3. Phenotype Prediction", 
-    "📋 4. Integrative Summary"
+    "📋 4. Integrative Summary",
     "🌐 5. Live UniProt API"
 ])
 
@@ -144,17 +143,17 @@ with tab1:
     with col1:
         st.markdown(f"""
         * **Selected / Custom Variant:** `{variant_choice}`
-        * **Destabilization ($\Delta \data G$):** `{delta_g_val} kcal/mol`
+        * **Destabilization ($\Delta \Delta G$):** `{delta_g_val} kcal/mol`
         * **Structural Interpretation:** {"Severe core packing disruption" if delta_g_val > 4.0 else "Moderate structural shift" if delta_g_val > 2.0 else "Minor surface mutation"}
         * **Estimated Residual Folding:** `{round(activity_val * 100, 1)}%`
         """)
     with col2:
         fig_gauge = go.Figure(go.Indicator(
-            mode = "gauge+number",
-            value = delta_g_val,
-            domain = {'x': [0, 1], 'y': [0, 1]},
-            title = {'text': "ΔΔG Stability Impact (kcal/mol)"},
-            gauge = {
+            mode="gauge+number",
+            value=delta_g_val,
+            domain={'x': [0, 1], 'y': [0, 1]},
+            title={'text': "ΔΔG Stability Impact (kcal/mol)"},
+            gauge={
                 'axis': {'range': [0, 7]},
                 'bar': {'color': "darkred" if delta_g_val > 4 else "orange" if delta_g_val > 2 else "green"},
                 'steps': [
@@ -233,10 +232,11 @@ with tab4:
     st.download_button(
         label="📥 Download Capstone Summary Report (CSV)",
         data=df_summary.to_csv(index=False).encode('utf-8'),
-        file_name=f"pku_capstone_report_custom.csv",
+        file_name="pku_capstone_report.csv",
         mime='text/csv'
     )
-    # --- TAB 5: LIVE UNIPROT API ---
+
+# --- TAB 5 ---
 with tab5:
     st.subheader("Live PAH Variant Feed (UniProt REST API: P00439)")
     st.markdown("Real-time clinical variants fetched directly from the UniProt Knowledgebase.")
@@ -248,8 +248,6 @@ with tab5:
         st.error(f"Could not connect to UniProt API: {error}")
     else:
         st.success(f"Successfully fetched **{len(df_live)} live PAH variants** from UniProt!")
-        
-        # Add a search bar so evaluators can look up any mutation (e.g., R408W)
         search_query = st.text_input("🔍 Search for a specific mutation (e.g., R408W, R261Q, PKU):", "")
         if search_query:
             filtered_df = df_live[
