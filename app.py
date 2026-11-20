@@ -1,3 +1,4 @@
+import re
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -21,6 +22,47 @@ st.markdown("""
 genome-scale metabolic flux analysis (FBA), and machine learning phenotype prediction.*
 """)
 st.markdown("---")
+
+# ==========================================
+# BIOPHYSICAL ESTIMATOR FOR LIVE VARIANTS
+# ==========================================
+# Kyte-Doolittle Hydrophobicity scale for biophysical ΔΔG proxy
+KD_SCALE = {
+    'A': 1.8, 'R': -4.5, 'N': -3.5, 'D': -3.5, 'C': 2.5,
+    'Q': -3.5, 'E': -3.5, 'G': -0.4, 'H': -3.2, 'I': 4.5,
+    'L': 3.8, 'K': -3.9, 'M': 1.9, 'F': 2.8, 'P': -1.6,
+    'S': -0.8, 'T': -0.7, 'W': -0.9, 'Y': -1.3, 'V': 4.2
+}
+
+def estimate_biophysical_params(wt, mut, pos, desc):
+    """
+    Estimates ΔΔG, residual activity, and BH4 responsiveness for any live UniProt variant
+    using Kyte-Doolittle hydrophobicity shifts, PAH domain location, and text mining.
+    """
+    desc_lower = str(desc).lower()
+    
+    # 1. Estimate ΔΔG from hydrophobicity shift + catalytic domain penalty (residues 143-410)
+    kd_diff = abs(KD_SCALE.get(wt, 0.0) - KD_SCALE.get(mut, 0.0))
+    in_catalytic = isinstance(pos, int) and (143 <= pos <= 410)
+    domain_weight = 1.35 if in_catalytic else 0.85
+    est_delta_g = round(min(6.8, max(0.6, (kd_diff * 0.55 + 1.2) * domain_weight)), 1)
+    
+    # 2. Extract residual activity from UniProt text if explicitly reported
+    pct_match = re.search(r'(\d+)\s*%', desc_lower)
+    if pct_match:
+        est_activity = round(min(1.0, max(0.0, int(pct_match.group(1)) / 100.0)), 2)
+    elif any(k in desc_lower for k in ["abolishes", "complete loss", "no activity", "0%"]):
+        est_activity = 0.02
+        est_delta_g = max(est_delta_g, 4.8)
+    elif any(k in desc_lower for k in ["mild", "mhp", "hyperphenylalaninemia"]):
+        est_activity = 0.55
+        est_delta_g = min(est_delta_g, 2.2)
+    else:
+        # Fallback: derive activity inversely from estimated ΔΔG
+        est_activity = round(max(0.02, min(0.90, 1.0 - (est_delta_g / 6.5))), 2)
+        
+    est_bh4 = est_activity >= 0.25
+    return est_delta_g, est_activity, est_bh4
 
 # ==========================================
 # MODEL & API CACHING
@@ -53,19 +95,23 @@ def fetch_live_uniprot_pah_variants():
         variants = []
         for feature in data.get("features", []):
             if feature.get("type") == "Natural variant":
-                pos = feature.get("location", {}).get("start", {}).get("value", "N/A")
+                pos = feature.get("location", {}).get("start", {}).get("value", None)
                 alt_seq = feature.get("alternativeSequence", {})
                 wt = alt_seq.get("originalSequence", "")
                 muts = alt_seq.get("alternativeSequences", [])
                 mut = muts[0] if muts else ""
                 desc = feature.get("description", "No clinical description available")
                 
-                if wt and mut:
+                if wt and mut and len(wt) == 1 and len(mut) == 1:
+                    dg, act, bh4 = estimate_biophysical_params(wt, mut, pos, desc)
                     variants.append({
                         "Mutation": f"{wt}{pos}{mut}",
                         "Position": pos,
                         "Wild-Type": wt,
                         "Mutant": mut,
+                        "Est. ΔΔG": dg,
+                        "Est. Activity": act,
+                        "Est. BH4": bh4,
                         "Clinical Annotation (UniProt)": desc
                     })
         return pd.DataFrame(variants), None
@@ -73,17 +119,18 @@ def fetch_live_uniprot_pah_variants():
         return pd.DataFrame(), str(e)
 
 rf_model = load_ml_classifier()
+df_live, api_error = fetch_live_uniprot_pah_variants()
 
 # ==========================================
-# SESSION STATE & PRESETS SETUP
+# PRESETS & SESSION STATE
 # ==========================================
-PAH_DEFAULTS = {
-    "R408W (Classical PKU)": {"delta_g": 5.2, "activity": 0.02, "phenotype": "Classical PKU", "bh4": False},
-    "R261Q (Mild PKU)": {"delta_g": 2.2, "activity": 0.35, "phenotype": "Mild PKU", "bh4": True},
-    "I65T (Mild HPA)": {"delta_g": 1.1, "activity": 0.68, "phenotype": "Mild HPA", "bh4": True},
-    "R158Q (Classical PKU)": {"delta_g": 4.7, "activity": 0.06, "phenotype": "Classical PKU", "bh4": False},
-    "Y414C (Mild PKU)": {"delta_g": 2.9, "activity": 0.26, "phenotype": "Mild PKU", "bh4": True},
-    "Custom Mutation": {"delta_g": 3.0, "activity": 0.30, "phenotype": "Custom", "bh4": False}
+PAH_BENCHMARKS = {
+    "R408W (Classical PKU)": {"delta_g": 5.2, "activity": 0.02, "annotation": "Classical PKU (Benchmark)", "bh4": False},
+    "R261Q (Mild PKU)": {"delta_g": 2.2, "activity": 0.35, "annotation": "Mild PKU (Benchmark)", "bh4": True},
+    "I65T (Mild HPA)": {"delta_g": 1.1, "activity": 0.68, "annotation": "Mild HPA (Benchmark)", "bh4": True},
+    "R158Q (Classical PKU)": {"delta_g": 4.7, "activity": 0.06, "annotation": "Classical PKU (Benchmark)", "bh4": False},
+    "Y414C (Mild PKU)": {"delta_g": 2.9, "activity": 0.26, "annotation": "Mild PKU (Benchmark)", "bh4": True},
+    "Custom Mutation": {"delta_g": 3.0, "activity": 0.30, "annotation": "Manual Custom Tuning", "bh4": False}
 }
 
 if "delta_g" not in st.session_state:
@@ -92,24 +139,53 @@ if "activity" not in st.session_state:
     st.session_state.activity = 0.02
 if "bh4" not in st.session_state:
     st.session_state.bh4 = False
+if "annotation" not in st.session_state:
+    st.session_state.annotation = "Classical PKU (Benchmark)"
 
-def update_preset():
+def on_variant_change():
+    source = st.session_state.data_source
     selected = st.session_state.variant_selectbox
-    if selected != "Custom Mutation":
-        st.session_state.delta_g = PAH_DEFAULTS[selected]["delta_g"]
-        st.session_state.activity = PAH_DEFAULTS[selected]["activity"]
-        st.session_state.bh4 = PAH_DEFAULTS[selected]["bh4"]
+    
+    if source == "Curated Benchmarks":
+        if selected != "Custom Mutation":
+            st.session_state.delta_g = PAH_BENCHMARKS[selected]["delta_g"]
+            st.session_state.activity = PAH_BENCHMARKS[selected]["activity"]
+            st.session_state.bh4 = PAH_BENCHMARKS[selected]["bh4"]
+            st.session_state.annotation = PAH_BENCHMARKS[selected]["annotation"]
+        else:
+            st.session_state.annotation = "Manual Custom Tuning"
+    else:
+        row = df_live[df_live["Mutation"] == selected].iloc[0]
+        st.session_state.delta_g = float(row["Est. ΔΔG"])
+        st.session_state.activity = float(row["Est. Activity"])
+        st.session_state.bh4 = bool(row["Est. BH4"])
+        st.session_state.annotation = row["Clinical Annotation (UniProt)"]
 
 # ==========================================
 # SIDEBAR CONTROLS
 # ==========================================
 st.sidebar.header("⚙️ Simulation Controls")
 
+source_options = ["Curated Benchmarks"]
+if not df_live.empty:
+    source_options.append("Live UniProt API Variants")
+
+data_source = st.sidebar.radio(
+    "Variant Data Source:",
+    source_options,
+    key="data_source"
+)
+
+if data_source == "Curated Benchmarks":
+    variant_options = list(PAH_BENCHMARKS.keys())
+else:
+    variant_options = df_live["Mutation"].unique().tolist()
+
 variant_choice = st.sidebar.selectbox(
-    "Select PAH Variant:", 
-    list(PAH_DEFAULTS.keys()), 
+    "Select PAH Variant:",
+    variant_options,
     key="variant_selectbox",
-    on_change=update_preset
+    on_change=on_variant_change
 )
 
 st.sidebar.markdown("---")
@@ -119,11 +195,7 @@ delta_g_val = st.sidebar.slider("Structural Destabilization (ΔΔG kcal/mol)", 0
 activity_val = st.sidebar.slider("Residual PAH Activity Fraction", 0.0, 1.0, key="activity", step=0.01)
 bh4_override = st.sidebar.checkbox("BH4 Responsive", key="bh4")
 
-current_phenotype = PAH_DEFAULTS[variant_choice]["phenotype"]
-if variant_choice == "Custom Mutation":
-    st.sidebar.info("🔧 **Custom Mode Active:** Adjust sliders freely to simulate custom mutations.")
-else:
-    st.sidebar.info(f"**ClinVar Annotation:** {current_phenotype}")
+st.sidebar.info(f"**Annotation:** {st.session_state.annotation}")
 
 # ==========================================
 # MAIN DASHBOARD TABS
@@ -138,11 +210,11 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 
 # --- TAB 1 ---
 with tab1:
-    st.subheader("Phase 1: Structural Stability & FoldX ΔΔG Estimation")
+    st.subheader("Phase 1: Structural Stability & ΔΔG Estimation")
     col1, col2 = st.columns(2)
     with col1:
         st.markdown(f"""
-        * **Selected / Custom Variant:** `{variant_choice}`
+        * **Selected Variant:** `{variant_choice}` ({data_source})
         * **Destabilization ($\Delta \Delta G$):** `{delta_g_val} kcal/mol`
         * **Structural Interpretation:** {"Severe core packing disruption" if delta_g_val > 4.0 else "Moderate structural shift" if delta_g_val > 2.0 else "Minor surface mutation"}
         * **Estimated Residual Folding:** `{round(activity_val * 100, 1)}%`
@@ -210,6 +282,7 @@ with tab4:
     st.subheader("Phase 4: Comprehensive Capstone Summary Report")
     summary_data = {
         "Metric": [
+            "Data Source",
             "Variant Analyzed", 
             "Structural Destabilization (ΔΔG)", 
             "Residual Enzyme Activity", 
@@ -218,6 +291,7 @@ with tab4:
             "Predicted Clinical Phenotype"
         ],
         "Value": [
+            data_source,
             variant_choice,
             f"{delta_g_val} kcal/mol",
             f"{round(activity_val * 100, 1)}%",
@@ -232,22 +306,19 @@ with tab4:
     st.download_button(
         label="📥 Download Capstone Summary Report (CSV)",
         data=df_summary.to_csv(index=False).encode('utf-8'),
-        file_name="pku_capstone_report.csv",
+        file_name=f"pku_capstone_report_{variant_choice.split()[0]}.csv",
         mime='text/csv'
     )
 
 # --- TAB 5 ---
 with tab5:
     st.subheader("Live PAH Variant Feed (UniProt REST API: P00439)")
-    st.markdown("Real-time clinical variants fetched directly from the UniProt Knowledgebase.")
+    st.markdown("Real-time clinical variants fetched directly from UniProt, enriched with biophysical $\Delta\Delta G$ and activity estimates.")
     
-    with st.spinner("Fetching live PAH variants from UniProt..."):
-        df_live, error = fetch_live_uniprot_pah_variants()
-        
-    if error:
-        st.error(f"Could not connect to UniProt API: {error}")
+    if api_error:
+        st.error(f"Could not connect to UniProt API: {api_error}")
     else:
-        st.success(f"Successfully fetched **{len(df_live)} live PAH variants** from UniProt!")
+        st.success(f"Successfully fetched & integrated **{len(df_live)} live PAH variants** from UniProt!")
         search_query = st.text_input("🔍 Search for a specific mutation (e.g., R408W, R261Q, PKU):", "")
         if search_query:
             filtered_df = df_live[
